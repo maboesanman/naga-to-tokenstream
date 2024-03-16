@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use naga::{Binding, VectorSize};
 use proc_macro2::TokenStream;
 
 /// Returns a base Rust or `glam` type that corresponds to a TypeInner, if one exists.
@@ -185,11 +186,17 @@ impl TypesDefinitions {
                     }
                 }
 
+                let struct_name = syn::parse_str::<syn::Ident>(struct_name).ok();
+
+                if struct_name.is_none() {
+                    return None;
+                }
+
                 let members_have_names = members.iter().all(|member| member.name.is_some());
-                let members: Option<Vec<_>> = members
+                let members: Vec<_> = members
                     .into_iter()
                     .enumerate()
-                    .map(|(i_member, member)| {
+                    .filter_map(|(i_member, member)| {
                         let member_name = if members_have_names {
                             let member_name =
                                 member.name.as_ref().expect("all members had names").clone();
@@ -198,6 +205,7 @@ impl TypesDefinitions {
                             syn::parse_str::<syn::Ident>(&format!("v{}", i_member))
                         };
                         let member_ty = self.rust_type_ident(member.ty, module);
+                        let member_wgpu_ty = self.wgpu_type_ident(member.ty, module);
 
                         let mut attributes = proc_macro2::TokenStream::new();
                         // Runtime-sized fields must be marked as such when using encase
@@ -218,44 +226,115 @@ impl TypesDefinitions {
                             }
                         }
 
-                        member_ty.and_then(|member_ty| {
-                            member_name.ok().map(|member_name| {
-                                if member_name.to_string().starts_with('_') && omit_underscore_prefixed {
-                                    quote::quote! {
-                                        #attributes
-                                        #member_name: #member_ty
-                                    }
-                                } else {
-                                    quote::quote! {
-                                        #attributes
-                                        pub #member_name: #member_ty
-                                    }
-                                }
-                            })
-                        })
+                        let member_name = match member_name {
+                            Ok(member_name_ident) => member_name_ident,
+                            Err(_) => return None,
+                        };
+
+                        let member_ty = match member_ty {
+                            Some(member_ty) => member_ty,
+                            None => return None,
+                        };
+
+                        let token_stream = if member_name.to_string().starts_with('_')
+                            && omit_underscore_prefixed
+                        {
+                            quote::quote! {
+                                #attributes
+                                #member_name: #member_ty
+                            }
+                        } else {
+                            quote::quote! {
+                                #attributes
+                                pub #member_name: #member_ty
+                            }
+                        };
+
+                        let binding = match (&member.binding, member_wgpu_ty) {
+                            (Some(binding), Some(wgpu_ty)) => Some((binding, wgpu_ty)),
+                            _ => None,
+                        };
+
+                        Some((member_name, token_stream, binding))
                     })
                     .collect();
-                let struct_name = syn::parse_str::<syn::Ident>(struct_name).ok();
-                match (members, struct_name) {
-                    (Some(members), Some(struct_name)) => {
-                        #[allow(unused_mut)]
-                        let mut bonus_struct_derives = TokenStream::new();
-                        #[cfg(feature = "encase")]
-                        bonus_struct_derives.extend(quote::quote!(encase::ShaderType,));
-                        #[cfg(feature = "bytemuck")]
-                        bonus_struct_derives.extend(quote::quote!(bytemuck::Pod, bytemuck::Zeroable,));
+
+                let bindings = members.iter().filter(|(_, _, binding)| binding.is_some());
+                let location_bindings =
+                    members
+                        .iter()
+                        .filter_map(|(member_name, _, binding)| match binding {
+                            Some((Binding::Location { location, .. }, wgpu_ty)) => {
+                                Some((member_name, wgpu_ty, location))
+                            }
+                            _ => None,
+                        });
+
+                #[allow(unused_mut)]
+                let mut bonus_struct_derives = TokenStream::new();
+
+                let mut push_struct_def = || {
+                    let member_token_streams =
+                        members.iter().map(|(_, token_stream, _)| token_stream);
+
+                    self.definitions.push(syn::parse_quote! {
+                        #[allow(unused, non_camel_case_types)]
+                        #[derive(Debug, PartialEq, Clone, Default, #bonus_struct_derives)]
+                        pub struct #struct_name {
+                            #(#member_token_streams ,)*
+                        }
+                    });
+                };
+
+                if !bindings.clone().next().is_some() {
+                    // this is a uniform
+                    #[cfg(feature = "encase")]
+                    bonus_struct_derives.extend(quote::quote!(encase::ShaderType,));
+
+                    push_struct_def();
+                }
+
+                if location_bindings.clone().next().is_some() {
+                    // this is a vertex buffer. generate the wgpu::VertexBufferLayout, and don't derive encase::ShaderType
+                    #[cfg(feature = "bytemuck")]
+                    bonus_struct_derives.extend(quote::quote!(bytemuck::Pod, bytemuck::Zeroable,));
+
+                    push_struct_def();
+
+                    #[cfg(feature = "wgsl")]
+                    {
+                        let location_count = location_bindings.clone().count();
+
+                        let attributes =
+                            location_bindings.map(|(member_name, member_wgpu_ty, location)| {
+                                quote::quote! {
+                                    wgpu::VertexAttribute {
+                                        format: #member_wgpu_ty,
+                                        offset: offset_of!(#struct_name, #member_name) as _,
+                                        shader_location: #location,
+                                    },
+                                }
+                            });
 
                         self.definitions.push(syn::parse_quote! {
-                            #[allow(unused, non_camel_case_types)]
-                            #[derive(Debug, PartialEq, Clone, Default, #bonus_struct_derives)]
-                            pub struct #struct_name {
-                                #(#members ,)*
+                            impl #struct_name {
+                                pub const fn desc(step_mode: wgpu::VertexStepMode::Vertex) -> wgpu::VertexBufferLayout<'static> {
+                                    const ATTRIBUTES: [wgpu::VertexAttribute; #location_count] = [
+                                        #(#attributes )*
+                                    ];
+
+                                    wgpu::VertexBufferLayout {
+                                        array_stride: core::mem::size_of::<Self>() as wgpu::BufferAddress,
+                                        step_mode,
+                                        attributes: &ATTRIBUTES,
+                                    }
+                                }
                             }
                         });
-                        Some(syn::parse_quote!(#struct_name))
                     }
-                    _ => None,
                 }
+
+                Some(syn::parse_quote!(#struct_name))
             }
             _ => None,
         }
@@ -280,6 +359,55 @@ impl TypesDefinitions {
         }
 
         return None;
+    }
+
+    /// Takes a handle to a type, and a module where the type resides, and tries to return an identifier
+    /// of that type, as a wgpu::VertexFormat.
+    pub fn wgpu_type_ident(
+        &mut self,
+        ty_handle: naga::Handle<naga::Type>,
+        module: &naga::Module,
+    ) -> Option<syn::Type> {
+        let ty = module.types.get_handle(ty_handle).ok()?;
+
+        match &ty.inner {
+            #[rustfmt::skip]
+            naga::TypeInner::Scalar(scalar) => {
+                match (scalar.kind, scalar.width) {
+                    (naga::ScalarKind::Float, 4) => Some(syn::parse_quote!(wgpu::VertexFormat::Float32)),
+                    (naga::ScalarKind::Uint, 4) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint32)),
+                    (naga::ScalarKind::Sint, 4) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint32)),
+                    (naga::ScalarKind::Float, 8) => Some(syn::parse_quote!(wgpu::VertexFormat::Float64)),
+                    _ => None,
+                }
+            },
+            #[rustfmt::skip]
+            naga::TypeInner::Vector { size, scalar } => {
+                match (scalar.kind, scalar.width, size) {
+                    (naga::ScalarKind::Uint, 1, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint8x2)),
+                    (naga::ScalarKind::Uint, 1, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint8x4)),
+                    (naga::ScalarKind::Sint, 1, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint8x2)),
+                    (naga::ScalarKind::Sint, 1, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint8x4)),
+                    (naga::ScalarKind::Uint, 2, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint16x2)),
+                    (naga::ScalarKind::Uint, 2, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint16x4)),
+                    (naga::ScalarKind::Sint, 2, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint16x2)),
+                    (naga::ScalarKind::Sint, 2, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint16x4)),
+                    (naga::ScalarKind::Float, 2, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Float16x2)),
+                    (naga::ScalarKind::Float, 2, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Float16x4)),
+                    (naga::ScalarKind::Uint, 4, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint32x2)),
+                    (naga::ScalarKind::Uint, 4, VectorSize::Tri) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint32x3)),
+                    (naga::ScalarKind::Uint, 4, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Uint32x4)),
+                    (naga::ScalarKind::Sint, 4, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint32x2)),
+                    (naga::ScalarKind::Sint, 4, VectorSize::Tri) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint32x3)),
+                    (naga::ScalarKind::Sint, 4, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Sint32x4)),
+                    (naga::ScalarKind::Float, 4, VectorSize::Bi) => Some(syn::parse_quote!(wgpu::VertexFormat::Float32x2)),
+                    (naga::ScalarKind::Float, 4, VectorSize::Tri) => Some(syn::parse_quote!(wgpu::VertexFormat::Float32x3)),
+                    (naga::ScalarKind::Float, 4, VectorSize::Quad) => Some(syn::parse_quote!(wgpu::VertexFormat::Float32x4)),
+                    _ => None,
+                }
+            },
+            _ => None,
+        }
     }
 
     /// Gives the set of definitions required by the identifiers generated by this object. These should be
