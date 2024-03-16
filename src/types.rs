@@ -239,15 +239,12 @@ impl TypesDefinitions {
                         let token_stream = if member_name.to_string().starts_with('_')
                             && omit_underscore_prefixed
                         {
-                            quote::quote! {
-                                #attributes
-                                #member_name: #member_ty
-                            }
+                            None
                         } else {
-                            quote::quote! {
+                            Some(quote::quote! {
                                 #attributes
                                 pub #member_name: #member_ty
-                            }
+                            })
                         };
 
                         let binding = match (&member.binding, member_wgpu_ty) {
@@ -269,69 +266,65 @@ impl TypesDefinitions {
                             }
                             _ => None,
                         });
+                let token_streams =
+                        members.iter().filter_map(|(_, token_stream, _)| token_stream.as_ref());
 
                 #[allow(unused_mut)]
                 let mut bonus_struct_derives = TokenStream::new();
 
-                let mut push_struct_def = || {
-                    let member_token_streams =
-                        members.iter().map(|(_, token_stream, _)| token_stream);
+                #[allow(unused)]
+                let is_uniform = bindings.clone().next().is_none();
 
-                    self.definitions.push(syn::parse_quote! {
-                        #[allow(unused, non_camel_case_types)]
-                        #[derive(Debug, PartialEq, Clone, Default, #bonus_struct_derives)]
-                        pub struct #struct_name {
-                            #(#member_token_streams ,)*
-                        }
-                    });
-                };
+                let has_location_binds = location_bindings.clone().next().is_some();
 
-                if !bindings.clone().next().is_some() {
-                    // this is a uniform
-                    #[cfg(feature = "encase")]
+                #[cfg(feature = "encase")]
+                if is_uniform {
                     bonus_struct_derives.extend(quote::quote!(encase::ShaderType,));
-
-                    push_struct_def();
                 }
 
-                if location_bindings.clone().next().is_some() {
-                    // this is a vertex buffer. generate the wgpu::VertexBufferLayout, and don't derive encase::ShaderType
-                    #[cfg(feature = "bytemuck")]
+                #[cfg(feature = "bytemuck")]
+                if has_location_binds {
                     bonus_struct_derives.extend(quote::quote!(bytemuck::Pod, bytemuck::Zeroable,));
+                }
 
-                    push_struct_def();
+                self.definitions.push(syn::parse_quote! {
+                    #[allow(unused, non_camel_case_types)]
+                    #[derive(Debug, PartialEq, Clone, Default, #bonus_struct_derives)]
+                    pub struct #struct_name {
+                        #(#token_streams ,)*
+                    }
+                });
 
-                    #[cfg(feature = "wgsl")]
-                    {
-                        let location_count = location_bindings.clone().count();
+                #[cfg(feature = "wgsl")]
+                if has_location_binds {
+                    let location_count = location_bindings.clone().count();
 
-                        let attributes =
-                            location_bindings.map(|(member_name, member_wgpu_ty, location)| {
-                                quote::quote! {
-                                    wgpu::VertexAttribute {
-                                        format: #member_wgpu_ty,
-                                        offset: offset_of!(#struct_name, #member_name) as _,
-                                        shader_location: #location,
-                                    },
-                                }
-                            });
-
-                        self.definitions.push(syn::parse_quote! {
-                            impl #struct_name {
-                                pub const fn desc(step_mode: wgpu::VertexStepMode::Vertex) -> wgpu::VertexBufferLayout<'static> {
-                                    const ATTRIBUTES: [wgpu::VertexAttribute; #location_count] = [
-                                        #(#attributes )*
-                                    ];
-
-                                    wgpu::VertexBufferLayout {
-                                        array_stride: core::mem::size_of::<Self>() as wgpu::BufferAddress,
-                                        step_mode,
-                                        attributes: &ATTRIBUTES,
-                                    }
-                                }
+                    let attributes =
+                        location_bindings.map(|(member_name, member_wgpu_ty, location)| {
+                            quote::quote! {
+                                wgpu::VertexAttribute {
+                                    format: #member_wgpu_ty,
+                                    offset: offset_of!(#struct_name, #member_name) as _,
+                                    shader_location: #location,
+                                },
                             }
                         });
-                    }
+
+                    self.definitions.push(syn::parse_quote! {
+                        impl #struct_name {
+                            pub const fn desc(step_mode: wgpu::VertexStepMode::Vertex) -> wgpu::VertexBufferLayout<'static> {
+                                const ATTRIBUTES: [wgpu::VertexAttribute; #location_count] = [
+                                    #(#attributes )*
+                                ];
+
+                                wgpu::VertexBufferLayout {
+                                    array_stride: core::mem::size_of::<Self>() as wgpu::BufferAddress,
+                                    step_mode,
+                                    attributes: &ATTRIBUTES,
+                                }
+                            }
+                        }
+                    });
                 }
 
                 Some(syn::parse_quote!(#struct_name))
