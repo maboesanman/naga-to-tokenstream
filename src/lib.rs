@@ -23,9 +23,39 @@ fn collect_tokenstream<I: quote::ToTokens>(
     tokens
 }
 
+#[cfg(feature = "minify")]
+fn module_to_source_minified(module: &naga::Module, retain_entry_point: Option<String>) -> Option<String> {
+    module_to_source_inner(
+        module,
+        retain_entry_point,
+        wgsl_minifier::minify_module,
+        |src|  wgsl_minifier::minify_wgsl_source(&src),
+    )
+}
+
+fn module_to_source_unminified(module: &naga::Module, retain_entry_point: Option<String>) -> Option<String> {
+    module_to_source_inner(
+        module,
+        retain_entry_point,
+        |_| {},
+        |src| src,
+    )
+}
+
 fn module_to_source(module: &naga::Module, retain_entry_point: Option<String>) -> Option<String> {
+    #[cfg(all(feature = "minify", not(debug_assertions)))]
+    return module_to_source_minified(module, retain_entry_point);
+
+    module_to_source_unminified(module, retain_entry_point)
+}
+
+fn module_to_source_inner(
+    module: &naga::Module,
+    retain_entry_point: Option<String>,
+    minify_module: fn(&mut naga::Module),
+    minify_wgsl_source: fn(String) -> String,
+) -> Option<String> {
     // Clone since we sometimes modify things
-    #[allow(unused_mut)]
     let mut module = module.clone();
 
     // We allow only a single entry point, for specialised source strings per entry point.
@@ -34,10 +64,7 @@ fn module_to_source(module: &naga::Module, retain_entry_point: Option<String>) -
     }
 
     // If we minify, do the first pass before writing out
-    #[cfg(feature = "minify")]
-    {
-        wgsl_minifier::minify_module(&mut module);
-    }
+    minify_module(&mut module);
 
     // Mini validation to get module info
     let info = naga::valid::Validator::new(
@@ -53,10 +80,9 @@ fn module_to_source(module: &naga::Module, retain_entry_point: Option<String>) -
             .ok()?;
 
     // Remove whitespace if minifying
-    #[cfg(feature = "minify")]
-    let src = wgsl_minifier::minify_wgsl_source(&src);
+    let src = minify_wgsl_source(src);
 
-    return Some(src);
+    Some(src)
 }
 
 /// The configuration required to create a token stream describing a module.
