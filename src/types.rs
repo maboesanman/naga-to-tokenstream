@@ -137,7 +137,7 @@ impl TypesDefinitions {
         };
 
         for (ty_handle, _) in module.types.iter() {
-            if let Some(new_ty_ident) = res.try_make_type(ty_handle, module) {
+            if let Some(new_ty_ident) = res.try_make_type(ty_handle, module, true) {
                 res.references.insert(ty_handle, new_ty_ident.clone());
             }
         }
@@ -149,6 +149,7 @@ impl TypesDefinitions {
         &mut self,
         ty_handle: naga::Handle<naga::Type>,
         module: &naga::Module,
+        omit_underscore_prefixed: bool,
     ) -> Option<syn::Type> {
         let ty = match module.types.get_handle(ty_handle) {
             Err(_) => return None,
@@ -171,7 +172,7 @@ impl TypesDefinitions {
                 }
             }
             naga::TypeInner::Struct { members, .. } => {
-                let struct_name = ty.name.as_ref();
+                let struct_name = ty.name.as_deref();
                 let struct_name = match struct_name {
                     None => return None,
                     Some(struct_name) => struct_name,
@@ -219,9 +220,16 @@ impl TypesDefinitions {
 
                         member_ty.and_then(|member_ty| {
                             member_name.ok().map(|member_name| {
-                                quote::quote! {
-                                    #attributes
-                                    pub #member_name: #member_ty
+                                if member_name.to_string().starts_with('_') && omit_underscore_prefixed {
+                                    quote::quote! {
+                                        #attributes
+                                        #member_name: #member_ty
+                                    }
+                                } else {
+                                    quote::quote! {
+                                        #attributes
+                                        pub #member_name: #member_ty
+                                    }
                                 }
                             })
                         })
@@ -266,7 +274,7 @@ impl TypesDefinitions {
             return Some(ident);
         }
 
-        if let Some(built) = self.try_make_type(ty_handle, module) {
+        if let Some(built) = self.try_make_type(ty_handle, module, true) {
             self.references.insert(ty_handle, built.clone());
             return Some(built);
         }
