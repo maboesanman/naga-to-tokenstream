@@ -24,22 +24,23 @@ fn collect_tokenstream<I: quote::ToTokens>(
 }
 
 #[cfg(feature = "minify")]
-fn module_to_source_minified(module: &naga::Module, retain_entry_point: Option<String>) -> Option<String> {
+fn module_to_source_minified(
+    module: &naga::Module,
+    retain_entry_point: Option<String>,
+) -> Option<String> {
     module_to_source_inner(
         module,
         retain_entry_point,
         wgsl_minifier::minify_module,
-        |src|  wgsl_minifier::minify_wgsl_source(&src),
+        |src| wgsl_minifier::minify_wgsl_source(&src),
     )
 }
 
-fn module_to_source_unminified(module: &naga::Module, retain_entry_point: Option<String>) -> Option<String> {
-    module_to_source_inner(
-        module,
-        retain_entry_point,
-        |_| {},
-        |src| src,
-    )
+fn module_to_source_unminified(
+    module: &naga::Module,
+    retain_entry_point: Option<String>,
+) -> Option<String> {
+    module_to_source_inner(module, retain_entry_point, |_| {}, |src| src)
 }
 
 fn module_to_source(module: &naga::Module, retain_entry_point: Option<String>) -> Option<String> {
