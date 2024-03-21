@@ -321,7 +321,7 @@ impl TypesDefinitions {
                             quote::quote! {
                                 wgpu::VertexAttribute {
                                     format: #member_wgpu_ty,
-                                    offset: crate::utils::offset_of::offset_of!(#struct_name, #member_name) as _,
+                                    offset: std::mem::offset_of!(#struct_name, #member_name) as _,
                                     shader_location: #location,
                                 },
                             }
